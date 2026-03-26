@@ -75,6 +75,15 @@ export interface CallTask {
   address?: string | null;
   lat?: number | null;
   lng?: number | null;
+  twilio_call_sid?: string | null;
+  transcript?: Array<{ role: string; text: string; ts: string }>;
+}
+
+export interface AuditEvent {
+  ts: string;
+  call_task_id: string;
+  event: string;
+  detail: string;
 }
 
 export interface StreamEvent {
@@ -82,6 +91,7 @@ export interface StreamEvent {
   session_status: SessionStatus;
   updated_at: string | null;
   call_tasks: CallTask[];
+  audit_events?: AuditEvent[];
   error?: string;
 }
 

@@ -11,6 +11,7 @@ from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
 from app.api.auth import router as auth_router
 from app.api.routes import router
+from app.api.voice_routes import voice_router
 from app.config import get_settings
 from app.core.database import close_db, init_db
 from app.core.redis import close_redis, get_redis
@@ -69,6 +70,7 @@ def create_app() -> FastAPI:
 
     app.include_router(auth_router)
     app.include_router(router)
+    app.include_router(voice_router)
 
     @app.get("/health")
     async def health():

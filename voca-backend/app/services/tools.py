@@ -265,3 +265,83 @@ async def _dispatch(tool_name: str, args: dict[str, Any]) -> str:
         "tool_name": tool_name,
         "message": f"No handler for tool: {tool_name}",
     })
+
+
+# ---------------------------------------------------------------------------
+# LangChain @tool wrappers — context-bound per call agent session
+# ---------------------------------------------------------------------------
+
+
+def get_langchain_tools(
+    session_id: str,
+    call_task_id: str,
+    user_id: str,
+    *,
+    provider_id: str = "",
+    provider_name: str = "",
+    provider_phone: str = "",
+) -> list:
+    """Return LangChain BaseTool instances with session context pre-bound via closure."""
+    from langchain_core.tools import tool as lc_tool
+
+    @lc_tool
+    async def check_availability_tool(date: str, time: str, duration_minutes: int = 30) -> str:
+        """Check if a provider has availability on a given date and time.
+        Returns JSON with status: held, conflict, or soft_conflict."""
+        return await check_availability(
+            date_str=date,
+            time_str=time,
+            duration_minutes=duration_minutes,
+            user_id=user_id,
+            session_id=session_id,
+            call_task_id=call_task_id,
+        )
+
+    @lc_tool
+    async def report_slot_offer_tool(
+        offered_provider_name: str, date: str, time: str, duration_minutes: int = 30, doctor_name: str = ""
+    ) -> str:
+        """Report a slot offered by the receptionist. Call after check_availability returns 'held'.
+        Returns JSON with received, ranking_position, instruction."""
+        return await report_slot_offer(
+            provider_name=offered_provider_name,
+            date_str=date,
+            time_str=time,
+            duration_minutes=duration_minutes,
+            doctor_name=doctor_name or None,
+            session_id=session_id,
+            call_task_id=call_task_id,
+        )
+
+    @lc_tool
+    async def book_slot_tool(
+        date: str,
+        time: str,
+        patient_name: str = "Alex Carter",
+        patient_phone: str = "",
+        duration_min: int = 30,
+        doctor_name: str = "",
+    ) -> str:
+        """Finalize and book the appointment after the receptionist confirms.
+        Returns JSON with booked (bool), reason, calendar_synced."""
+        return await book_slot(
+            date_str=date,
+            time_str=time,
+            patient_name=patient_name,
+            patient_phone=patient_phone,
+            session_id=session_id,
+            call_task_id=call_task_id,
+            user_id=user_id,
+            provider_id=provider_id,
+            provider_name=provider_name,
+            provider_phone=provider_phone,
+            duration_min=duration_min,
+            doctor_name=doctor_name or None,
+        )
+
+    @lc_tool
+    async def end_call_tool(status: str = "completed") -> str:
+        """End the call after booking is confirmed. status should be 'completed' or 'no_availability'."""
+        return json.dumps({"ended": True, "status": status, "session_id": session_id, "call_task_id": call_task_id})
+
+    return [check_availability_tool, report_slot_offer_tool, book_slot_tool, end_call_tool]

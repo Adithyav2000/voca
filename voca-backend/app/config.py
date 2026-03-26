@@ -29,7 +29,17 @@ class Settings(BaseSettings):
 
     # OpenAI (for voice conversations + transcription)
     OPENAI_API_KEY: str
-    OPENAI_VOICE_MODEL: str = "gpt-4o"  # Voice-capable model for conversations
+    OPENAI_VOICE_MODEL: str = "gpt-4o"  # Text model for intent analysis / fallback
+    OPENAI_REALTIME_MODEL: str = "gpt-4o-realtime-preview"  # Realtime API model
+    OPENAI_REALTIME_VOICE: str = "alloy"  # Realtime API voice (alloy, echo, shimmer, …)
+
+    # Demo mode: when True, all outbound calls go to DEMO_PHONE_NUMBERS
+    # instead of real provider phones. Set to False for production.
+    DEMO_MODE: bool = True
+    DEMO_PHONE_NUMBERS: str = "+18576939747,+17162953459"  # comma-separated
+
+    # Public URL (ngrok/cloudflare) — Twilio needs a routable callback URL
+    PUBLIC_API_URL: str = ""  # e.g. https://abc123.ngrok-free.app
 
     # Google OAuth (optional — set in .env to enable login + user calendar)
     # Accepts GOOGLE_OAUTH_CLIENT_ID or GOOGLE_CLIENT_ID (same for secret/redirect)
@@ -65,7 +75,14 @@ class Settings(BaseSettings):
     # Google APIs (Places + Distance Matrix; optional for fallback to mock)
     GOOGLE_API_KEY: str | None = None
 
-    @field_validator("OPENAI_API_KEY", "GOOGLE_API_KEY", mode="before")
+    @field_validator(
+        "OPENAI_API_KEY",
+        "GOOGLE_API_KEY",
+        "TWILIO_ACCOUNT_SID",
+        "TWILIO_AUTH_TOKEN",
+        "TWILIO_PHONE_NUMBER",
+        mode="before",
+    )
     @classmethod
     def strip_api_keys(cls, v: str | object) -> str | object:
         """Strip whitespace from API keys to avoid leading/trailing space issues."""

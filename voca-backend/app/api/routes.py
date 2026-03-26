@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.core.database import Appointment, Session, CallTask, User, get_db_session, get_session_factory
+from app.core.redis import get_redis
 from app.models import (
     BookSlotRequest,
     BookSlotResponse,
@@ -458,6 +459,8 @@ def _serialize_call_task(ct: CallTask) -> dict:
         "ended_at": ct.ended_at.isoformat() if ct.ended_at else None,
         "updated_at": ct.updated_at.isoformat() if ct.updated_at else None,
         "photo_url": ct.photo_url,
+        "twilio_call_sid": ct.twilio_call_sid,
+        "transcript": ct.transcript or [],
     }
 
 
@@ -474,9 +477,11 @@ async def session_stream(session_id: str):
 
     async def event_stream():
         last_snapshot: str | None = None
+        last_audit_len = 0
         last_ping = asyncio.get_running_loop().time()
         log = logger.bind(session_id=session_id, event_type="stream")
         factory = get_session_factory()
+        redis = await get_redis()
         while True:
             try:
                 now = asyncio.get_running_loop().time()
@@ -496,16 +501,24 @@ async def session_stream(session_id: str):
                         select(CallTask).where(CallTask.session_id == uid).order_by(CallTask.updated_at.desc())
                     )
                     tasks = list(r2.scalars().all())
+
+                # Fetch audit events from Redis
+                raw_audit = await redis.lrange(f"audit:{session_id}", 0, -1)
+                audit_events = [json.loads(e) for e in raw_audit]
+                cur_audit_len = len(audit_events)
+
                 payload = {
                     "session_id": session_id,
                     "session_status": booking_session.status,
                     "updated_at": booking_session.updated_at.isoformat() if booking_session.updated_at else None,
                     "call_tasks": [_serialize_call_task(t) for t in tasks],
+                    "audit_events": audit_events,
                 }
                 snapshot = json.dumps(payload, default=str)
-                if snapshot != last_snapshot:
+                if snapshot != last_snapshot or cur_audit_len != last_audit_len:
                     yield f"data: {snapshot}\n\n"
                     last_snapshot = snapshot
+                    last_audit_len = cur_audit_len
                     log.info("stream_event", timestamp_ms=round(datetime.now(timezone.utc).timestamp() * 1000))
 
                 if booking_session.status in ("confirmed", "failed", "cancelled"):
@@ -640,6 +653,70 @@ async def cancel_session(session_id: str) -> dict:
     await redis_client.publish(f"kill:{session_id}", "cancel")
     log.info("session_cancelled", timestamp_ms=round(datetime.now(timezone.utc).timestamp() * 1000))
     return {"status": "cancelled", "message": "Session cancelled, kill signal sent, holds released"}
+
+
+# ---------------------------------------------------------------------------
+# Intervene — hang up a specific call task's Twilio call
+# ---------------------------------------------------------------------------
+
+class InterveneRequest(BaseModel):
+    call_task_id: str
+
+
+@router.post("/sessions/{session_id}/intervene")
+async def intervene_call(session_id: str, body: InterveneRequest) -> dict:
+    """Hang up a live Twilio call so the user can take over or stop it."""
+    log = logger.bind(session_id=session_id, call_task_id=body.call_task_id, event_type="routes")
+    try:
+        ct_uid = UUID(body.call_task_id)
+        s_uid = UUID(session_id)
+    except ValueError:
+        raise HTTPException(status_code=422, detail="Invalid ID")
+
+    factory = get_session_factory()
+    async with factory() as db:
+        r = await db.execute(
+            select(CallTask).where(CallTask.id == ct_uid).where(CallTask.session_id == s_uid)
+        )
+        ct = r.scalar_one_or_none()
+        if not ct:
+            raise HTTPException(status_code=404, detail="Call task not found")
+        call_sid = ct.twilio_call_sid
+
+    if not call_sid:
+        log.warning("intervene_no_call_sid")
+        raise HTTPException(status_code=409, detail="No active Twilio call for this task")
+
+    from app.services.voice_service import hangup_call
+    await hangup_call(call_sid)
+
+    async with factory() as db:
+        await db.execute(
+            update(CallTask)
+            .where(CallTask.id == ct_uid)
+            .values(status="cancelled", ended_at=datetime.now(timezone.utc), updated_at=datetime.now(timezone.utc))
+        )
+        await db.commit()
+
+    log.info("call_intervened", call_sid=call_sid)
+    return {"status": "intervened", "call_task_id": body.call_task_id, "message": "Call hung up"}
+
+
+# ---------------------------------------------------------------------------
+# Audit trail — live events for a session
+# ---------------------------------------------------------------------------
+
+@router.get("/sessions/{session_id}/audit")
+async def session_audit(session_id: str) -> dict:
+    """Return all audit events stored for a session."""
+    try:
+        UUID(session_id)
+    except ValueError:
+        raise HTTPException(status_code=422, detail="Invalid session ID")
+    r = await get_redis()
+    raw_events = await r.lrange(f"audit:{session_id}", 0, -1)
+    events = [json.loads(e) for e in raw_events]
+    return {"session_id": session_id, "events": events}
 
 
 class ExtractEntitiesRequest(BaseModel):

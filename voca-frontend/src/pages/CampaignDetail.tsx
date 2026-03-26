@@ -1,4 +1,4 @@
-﻿import { useEffect, useState } from "react";
+﻿import { useEffect, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { motion } from "framer-motion";
 import { MapPin, FileText, CheckCircle2, XCircle, Activity } from "lucide-react";
@@ -48,11 +48,34 @@ export function SessionDetail() {
   const [confirmingId, setConfirmingId] = useState<string | null>(null);
   const [confirmError, setConfirmError] = useState<string | null>(null);
   const [confirmSuccess, setConfirmSuccess] = useState<ConfirmResponse | null>(null);
-  const { open: openAudit } = useAuditTrail();
+  const { open: openAudit, setEvents } = useAuditTrail();
+  const autoOpenedRef = useRef(false);
 
   const { data: streamData, streamError, isLive } = useSessionStream(sessionId ?? null);
   const status = streamData?.session_status ?? session?.status;
   const callTasks = streamData?.call_tasks ?? [];
+
+  // Push audit events from SSE stream into the context; auto-open sidebar on first events
+  useEffect(() => {
+    if (streamData?.audit_events && streamData.audit_events.length > 0) {
+      setEvents(streamData.audit_events);
+      if (!autoOpenedRef.current) {
+        autoOpenedRef.current = true;
+        openAudit();
+      }
+    }
+  }, [streamData?.audit_events, setEvents, openAudit]);
+
+  // After stream closes, do a final fetch to capture post-confirmation transcript
+  useEffect(() => {
+    if (isLive || !sessionId) return;
+    const timer = setTimeout(() => {
+      api<{ events: import("../types/api").AuditEvent[] }>(`/api/sessions/${sessionId}/audit`)
+        .then((res) => { if (res.events.length > 0) setEvents(res.events); })
+        .catch(() => {/* best-effort */});
+    }, 3000);
+    return () => clearTimeout(timer);
+  }, [isLive, sessionId, setEvents]);
 
   useEffect(() => {
     if (!sessionId) return;
@@ -103,6 +126,18 @@ export function SessionDetail() {
     try {
       await api(`/api/sessions/${sessionId}/cancel`, { method: "POST" });
       setSession((c) => (c ? { ...c, status: "cancelled" } : null));
+    } catch (e) {
+      setSessionError((e as Error).message);
+    }
+  }
+
+  async function interveneCall(callTaskId: string) {
+    if (!sessionId) return;
+    try {
+      await api(`/api/sessions/${sessionId}/intervene`, {
+        method: "POST",
+        body: { call_task_id: callTaskId },
+      });
     } catch (e) {
       setSessionError((e as Error).message);
     }
@@ -237,9 +272,10 @@ export function SessionDetail() {
                       <FileText className="h-2.5 w-2.5" />
                       log
                     </button>
-                    {(task.status === "slot_offered" || task.status === "negotiating") && (
+                    {(task.status === "slot_offered" || task.status === "negotiating" || task.status === "ringing") && (
                       <button
                         type="button"
+                        onClick={() => interveneCall(task.id)}
                         className="mt-1 w-full rounded bg-primary/80 py-0.5 text-[9px] font-semibold text-primary-foreground hover:bg-primary"
                       >
                         INTERVENE

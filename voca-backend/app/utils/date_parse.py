@@ -41,10 +41,58 @@ def parse_date_flexible(s: str) -> str | None:
 
 
 def parse_time_flexible(s: str) -> str | None:
-    """Return HH:MM 24h or None. Accepts 09:00, 9:00, 10 AM, 2:30 PM."""
+    """Return HH:MM 24h or None. Accepts 09:00, 9:00, 10 AM, 2:30 PM, morning, afternoon, evening, noon, etc."""
     if not s or not isinstance(s, str):
         return None
     s = s.strip()
+    lower = s.lower()
+
+    # Natural language periods → canonical hour
+    _PERIOD_MAP = {
+        "morning": "09:00",
+        "noon": "12:00",
+        "midday": "12:00",
+        "afternoon": "14:00",
+        "evening": "18:00",
+        "night": "19:00",
+        "anytime": "10:00",
+        "any time": "10:00",
+        "flexible": "10:00",
+        "asap": "09:00",
+        "as soon as possible": "09:00",
+        "now": "09:00",
+        "soonest": "09:00",
+    }
+    for phrase, canonical in _PERIOD_MAP.items():
+        if phrase in lower:
+            return canonical
+
+    # "after X PM" / "after X:00" → use that time directly
+    m_after = re.search(r"after\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?", lower)
+    if m_after:
+        h = int(m_after.group(1))
+        mi = int(m_after.group(2)) if m_after.group(2) else 0
+        suffix = m_after.group(3) or ""
+        if suffix == "pm" and h < 12:
+            h += 12
+        elif suffix == "am" and h == 12:
+            h = 0
+        if 0 <= h <= 23:
+            return f"{h:02d}:{mi:02d}"
+
+    # "between X PM and Y PM" → use lower bound
+    m_range = re.search(r"between\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?", lower)
+    if m_range:
+        h = int(m_range.group(1))
+        mi = int(m_range.group(2)) if m_range.group(2) else 0
+        suffix = m_range.group(3) or ""
+        if suffix == "pm" and h < 12:
+            h += 12
+        elif suffix == "am" and h == 12:
+            h = 0
+        if 0 <= h <= 23:
+            return f"{h:02d}:{mi:02d}"
+
     # Already HH:MM or H:MM
     m = re.match(r"^(\d{1,2}):(\d{2})\s*(am|pm)?$", s, re.I)
     if m:
@@ -64,6 +112,12 @@ def parse_time_flexible(s: str) -> str | None:
             h += 12
         elif m.group(2).lower() == "am" and h == 12:
             h = 0
+        if 0 <= h <= 23:
+            return f"{h:02d}:00"
+    # bare hour "10", "14" only if clearly numeric
+    m = re.match(r"^(\d{1,2})$", s)
+    if m:
+        h = int(m.group(1))
         if 0 <= h <= 23:
             return f"{h:02d}:00"
     return None

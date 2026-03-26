@@ -25,6 +25,8 @@ google-auth = "*"
 google-auth-oauthlib = "*"
 httpx = "*"
 cryptography = "*"
+langchain = "*"
+langchain-openai = "*"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "*"

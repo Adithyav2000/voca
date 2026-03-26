@@ -26,11 +26,11 @@ export function Sidebar() {
   const { logout } = useAuth();
   const { theme, toggle: toggleTheme } = useTheme();
   const { profile } = useUserProfile();
-  const { toggle: toggleAudit } = useAuditTrail();
+  const { toggle: toggleAudit, events: auditEvents } = useAuditTrail();
 
   return (
     <>
-      <AuditTrailSidebar />
+      <AuditTrailSidebar events={auditEvents} />
       {/* Fixed left sidebar */}
       <aside className="fixed inset-y-0 left-0 z-40 flex w-64 flex-col border-r border-border bg-card">
         {/* Brand */}

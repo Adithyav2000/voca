@@ -19,6 +19,11 @@ from openai import AsyncOpenAI
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.output_parsers import PydanticOutputParser
+from langchain.agents import create_agent
+
 from app.config import get_settings
 from app.core.database import Session, CallTask, get_session_factory
 from app.models.schemas import (
@@ -41,6 +46,8 @@ WEIGHT_EARLIEST = 0.5
 WEIGHT_RATING = 0.3
 WEIGHT_PROXIMITY = 0.2
 
+
+
 SERVICE_KEYWORDS: dict[str, tuple[str, ...]] = {
     "dentist": ("dentist", "dental", "tooth", "teeth", "orthodontist"),
     "doctor": ("doctor", "physician", "clinic", "checkup", "medical"),
@@ -55,12 +62,17 @@ SERVICE_KEYWORDS: dict[str, tuple[str, ...]] = {
 OPENAI_BRAIN_INSTRUCTIONS = (
     "You are calling ON BEHALF OF THE CUSTOMER (e.g. Alex Carter). You are the caller; the other party is the receptionist. Never act as or speak for the receptionist. "
     "All times are in Pacific (PST/PDT, America/Los_Angeles). When you say times, use Pacific. "
-    "You MUST use tools in this order; do not skip steps. "
-    "1) check_availability: Call when the receptionist offers a date and time. Use target_date and target_time from context for date/time. "
-    "2) report_slot_offer: Call immediately after check_availability returns 'held'. Use the same date and time you held, and the provider name the receptionist gave. Do not say the slot is confirmed until report_slot_offer is done. "
-    "3) book_slot: When the receptionist agrees (e.g. 'Okay', 'That works', 'Sure', 'Yes'), you MUST call book_slot to finalize. Pass appointment_date, appointment_time, patient_name, patient_phone, provider_id, provider_name, provider_phone, duration_min (e.g. 30), session_id, call_task_id, user_id. Only AFTER book_slot returns success may you say the appointment is booked, confirmed, or in the system. Never say 'successfully booked', 'confirmed', or 'booked in the system' without having called book_slot first and received a successful response. If you have not yet called book_slot, say you will finalize the booking now and then call the tool. "
-    "4) end_call: Call end_call ONLY after book_slot has been called and confirmed successful. When you have finished the booking and are saying goodbye, then call end_call with session_id, call_task_id, status 'completed', and hold_keys []. Do not call end_call before book_slot has succeeded. "
-    "Use target_date and target_time from context for date/time. Never use past years (e.g. 2024). Do not invent provider details."
+    "You MUST use tools in this order; never skip steps. "
+    "1) check_availability: Call when the receptionist offers a specific date and time. "
+    "   - If check_availability returns a CONFLICT with a reason like 'calendar conflict' or '[appointment name]', that time is already taken on the customer's calendar. Apologize and ask the receptionist for a DIFFERENT specific time. Keep trying different times until you find one that is free (returns 'held'). "
+    "   - If check_availability returns 'held', proceed to step 2. "
+    "   - IMPORTANT: Always pass a specific clock time like '9 AM', '2 PM', '14:00'. Never pass vague terms like 'anytime', 'morning', or 'flexible' — instead, propose a concrete time to the receptionist if they haven't suggested one. "
+    "2) report_slot_offer: Call immediately after check_availability returns 'held'. Use the exact same date and time. Do not say the slot is confirmed until this is done. "
+    "3) book_slot: When the receptionist confirms, call book_slot with all fields. "
+    "   - If book_slot returns a calendar conflict, the customer already has something scheduled. Ask for a different time and restart from step 1. "
+    "   - Only after book_slot returns success may you say the appointment is confirmed. "
+    "4) end_call: Call ONLY after book_slot succeeds. "
+    "Use target_date and target_time from context as the starting point. Never use past dates. Do not invent provider details."
 )
 
 
@@ -209,36 +221,49 @@ async def _run_call_agent(
     tz_str: str | None = None,
 ) -> None:
     """
-    Single call agent task (RFC 3.2 Phase 2). Uses OpenAI to simulate conversation,
-    then updates call_task in DB.
+    Single call agent task (RFC 3.2 Phase 2).
+    When Twilio + PUBLIC_API_URL are configured → real outbound phone call via Twilio
+    bridged to OpenAI Realtime API.  Otherwise → LangChain agent fallback.
     """
+    from app.services.voice_service import voice_enabled, initiate_outbound_call
+
     log = logger.bind(session_id=session_id, call_task_id=str(call_task_id), event_type=event_type)
     settings = get_settings()
 
-    # OpenAI conversation initialization
-    from openai import AsyncOpenAI
-    client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+    # ── Real voice path ────────────────────────────────────────────────
+    if voice_enabled():
+        log.info("call_agent_voice_mode", provider=provider.name)
+        try:
+            call_sid = await initiate_outbound_call(
+                call_task_id=call_task_id,
+                provider_phone=dial_phone,
+                session_id=session_id,
+            )
+            await _transition_session_status(session_id, "negotiating", only_if_current=["dialing"])
+            log.info("outbound_call_initiated", call_sid=call_sid, provider=provider.name)
+            # The actual conversation happens in the WebSocket bridge (realtime_bridge.py).
+            # This task's job is done — the bridge handles tool calls, transcript, and hangup.
+            return
+        except Exception as e:
+            log.exception("voice_call_failed", error=str(e))
+            # Mark as error — do NOT fall through to LangChain in voice mode
+            factory = get_session_factory()
+            async with factory() as session:
+                await session.execute(
+                    update(CallTask).where(CallTask.id == call_task_id).values(
+                        status="error",
+                        ended_at=datetime.now(timezone.utc),
+                        updated_at=datetime.now(timezone.utc),
+                    )
+                )
+                await session.commit()
+            return
 
-    # Prepare conversation context for OpenAI
-    system_prompt = f"""You are a helpful voice assistant calling on behalf of a customer named Alex Carter.
-You are calling a {service_type} provider to book an appointment.
+    # ── LangChain agent fallback (text-only) ───────────────────────────
+    log.info("call_agent_langchain_mode", provider=provider.name)
+    settings = get_settings()
 
-Key information:
-- Service needed: {service_type}
-- Preferred date: {target_date or 'as soon as possible'}
-- Preferred time: {target_time or 'flexible'}
-- Provider: {provider.name}
-- Phone: {dial_phone}
-- Timezone: {tz_str or 'America/Los_Angeles'}
-
-Your goal is to:
-1. Greet the receptionist professionally
-2. Inquire about availability for the requested date/time
-3. Report the offered slot back
-4. Confirm the booking
-
-Be natural and conversational. If the receptionist refuses or has no availability, acknowledge politely and end the call."""
-
+    # ---- Mark call task as ringing ----
     factory = get_session_factory()
     async with factory() as session:
         try:
@@ -255,75 +280,120 @@ Be natural and conversational. If the receptionist refuses or has no availabilit
             log.exception("call_agent_update_failed", error=str(e))
             return
 
-    # Simulate OpenAI conversation
-    try:
-        # Create a mock conversation turn
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Call {provider.name} at {dial_phone} to check availability for {target_date} at {target_time}."},
-        ]
-        
-        response = await client.chat.completions.create(
-            model=settings.OPENAI_VOICE_MODEL,
-            messages=messages,
-            max_tokens=500,
-            temperature=0.7,
-        )
-        
-        log.info("openai_conversation_started", provider=provider.name, session_id=session_id)
-    except Exception as e:
-        log.exception("openai_conversation_error", error=str(e))
+    # ---- Build LangChain AgentExecutor ----
+    system_prompt = (
+        f"You are a helpful voice assistant calling on behalf of a customer named Alex Carter.\n"
+        f"You are calling a {service_type} provider to book an appointment.\n\n"
+        f"Key information:\n"
+        f"- Service needed: {service_type}\n"
+        f"- Preferred date: {target_date or 'as soon as possible'}\n"
+        f"- Preferred time: {target_time or 'flexible'}\n"
+        f"- Provider: {provider.name}\n"
+        f"- Phone: {dial_phone}\n"
+        f"- Timezone: {tz_str or 'America/Los_Angeles'}\n\n"
+        f"{OPENAI_BRAIN_INSTRUCTIONS}\n\n"
+        f"Use these context values when calling tools:\n"
+        f"- session_id: {session_id}\n"
+        f"- call_task_id: {str(call_task_id)}\n"
+        f"- user_id: {user_id}\n"
+    )
 
-    # Simulate negotiation: after a short delay, "offer" first slot and set score
-    import random
-    await asyncio.sleep(random.uniform(0.5, 2.5))
-    slot = provider.available_slots[0] if provider.available_slots else None
-    if not slot:
-        # Generate a simulated slot from the requested date/time
-        from app.models.schemas import AvailableSlot
-        base_date = target_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        # Convert keyword times to concrete HH:MM
-        _time_keywords = {"morning": "09:00", "afternoon": "14:00", "evening": "19:00", "night": "20:00", "any": "10:00"}
-        raw_time = target_time or "10:00"
-        base_time = _time_keywords.get(raw_time.lower().strip(), raw_time)
-        try:
-            d = datetime.strptime(base_date, "%Y-%m-%d")
-            d += timedelta(days=random.randint(-2, 2))
-            base_date = d.strftime("%Y-%m-%d")
-        except ValueError:
-            pass
-        try:
-            h, m = int(base_time[:2]), int(base_time[3:5])
-            h = max(8, min(17, h + random.randint(-2, 2)))
-            base_time = f"{h:02d}:{m:02d}"
-        except (ValueError, IndexError):
-            base_time = "10:00"
-        slot = AvailableSlot(date=base_date, time=base_time, duration_min=30)
-    distance_km = provider.distance_km if provider.distance_km is not None else 5.0
-    score = _match_quality_score(slot.date, slot.time, provider.rating, distance_km)
+    from app.services.tools import get_langchain_tools
+    tools = get_langchain_tools(
+        session_id=session_id,
+        call_task_id=str(call_task_id),
+        user_id=user_id,
+        provider_id=provider.id,
+        provider_name=provider.name,
+        provider_phone=provider.phone,
+    )
+
+    llm = ChatOpenAI(
+        api_key=settings.OPENAI_API_KEY,
+        model=settings.OPENAI_VOICE_MODEL,
+        temperature=0.7,
+    )
+
+    agent = create_agent(
+        model=llm,
+        tools=tools,
+        system_prompt=system_prompt,
+    )
+
+    human_input = (
+        f"Call {provider.name} at {dial_phone} to book a {service_type} appointment. "
+        f"Check availability for {target_date or 'the earliest date'} at {target_time or 'any time'}, "
+        f"then report the slot and book it."
+    )
+
+    try:
+        result = await agent.ainvoke({"messages": [{"role": "user", "content": human_input}]})
+        output_messages = result.get("messages", [])
+        last_msg = output_messages[-1].content if output_messages else ""
+        log.info(
+            "langchain_agent_loop_complete",
+            provider=provider.name,
+            output=str(last_msg)[:200],
+        )
+    except Exception as e:
+        log.exception("langchain_agent_error", error=str(e))
+
+    # ---- Fallback: if the agent didn't call report_slot_offer, simulate a slot ----
     async with factory() as session:
-        try:
-            from datetime import time as dt_time
-            hour, minute = int(slot.time[:2]), int(slot.time[3:5])
-            t = dt_time(hour, minute)
-            from datetime import date as dt_date
-            d = dt_date.fromisoformat(slot.date)
-            await session.execute(
-                update(CallTask).where(CallTask.id == call_task_id).values(
-                    status="slot_offered",
-                    offered_date=d,
-                    offered_time=t,
-                    offered_duration_min=slot.duration_min,
-                    offered_doctor=slot.doctor,
-                    score=round(score, 4),
-                    distance_km=distance_km,
-                    updated_at=datetime.now(timezone.utc),
+        r = await session.execute(
+            select(CallTask).where(CallTask.id == call_task_id)
+        )
+        ct = r.scalar_one_or_none()
+    agent_offered = ct and ct.status in ("slot_offered", "booked")
+
+    if not agent_offered:
+        log.info("agent_fallback_simulated_slot", provider=provider.name)
+        import random
+        from app.models.schemas import AvailableSlot
+        slot = provider.available_slots[0] if provider.available_slots else None
+        if not slot:
+            base_date = target_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            _time_keywords = {"morning": "09:00", "afternoon": "14:00", "evening": "19:00", "night": "20:00", "any": "10:00"}
+            raw_time = target_time or "10:00"
+            base_time = _time_keywords.get(raw_time.lower().strip(), raw_time)
+            try:
+                d = datetime.strptime(base_date, "%Y-%m-%d")
+                d += timedelta(days=random.randint(-2, 2))
+                base_date = d.strftime("%Y-%m-%d")
+            except ValueError:
+                pass
+            try:
+                h, m = int(base_time[:2]), int(base_time[3:5])
+                h = max(8, min(17, h + random.randint(-2, 2)))
+                base_time = f"{h:02d}:{m:02d}"
+            except (ValueError, IndexError):
+                base_time = "10:00"
+            slot = AvailableSlot(date=base_date, time=base_time, duration_min=30)
+        distance_km = provider.distance_km if provider.distance_km is not None else 5.0
+        score = _match_quality_score(slot.date, slot.time, provider.rating, distance_km)
+        async with factory() as session:
+            try:
+                from datetime import time as dt_time
+                hour, minute = int(slot.time[:2]), int(slot.time[3:5])
+                t = dt_time(hour, minute)
+                from datetime import date as dt_date
+                d = dt_date.fromisoformat(slot.date)
+                await session.execute(
+                    update(CallTask).where(CallTask.id == call_task_id).values(
+                        status="slot_offered",
+                        offered_date=d,
+                        offered_time=t,
+                        offered_duration_min=slot.duration_min,
+                        offered_doctor=slot.doctor,
+                        score=round(score, 4),
+                        distance_km=distance_km,
+                        updated_at=datetime.now(timezone.utc),
+                    )
                 )
-            )
-            await session.commit()
-            await _transition_session_status(session_id, "ranking", only_if_current=["dialing", "negotiating"])
-        except Exception as e:
-            log.exception("call_agent_offer_failed", error=str(e))
+                await session.commit()
+                await _transition_session_status(session_id, "ranking", only_if_current=["dialing", "negotiating"])
+            except Exception as e:
+                log.exception("call_agent_offer_failed", error=str(e))
 
 
 async def bootstrap_session_record(request: SessionRequest, user_id: str) -> str:
@@ -388,7 +458,16 @@ async def run_session_orchestration(
     if not providers:
         await _transition_session_status(session_id, "failed")
         raise ValueError("No providers found. Ensure Google Places API key is configured and location is valid.")
-    n_tasks = min(MAX_CALL_AGENTS_LIVE, len(providers))
+
+    # In demo mode, cap providers to the number of demo phones so each phone
+    # gets exactly one simultaneous call (a phone can only answer one at a time).
+    cfg = get_settings()
+    max_tasks = MAX_CALL_AGENTS_LIVE
+    if cfg.DEMO_MODE and cfg.DEMO_PHONE_NUMBERS:
+        demo_nums = [n.strip() for n in cfg.DEMO_PHONE_NUMBERS.split(",") if n.strip()]
+        if demo_nums:
+            max_tasks = len(demo_nums)
+    n_tasks = min(max_tasks, len(providers))
 
     providers = providers[:n_tasks]
     logger.info("providers_found", providers_found=len(providers), session_id=session_id, event_type="orchestrator")
@@ -433,12 +512,22 @@ async def run_session_orchestration(
         provider = next((x for x in providers if x.id == ct.provider_id), None)
         if not provider:
             continue
+
+        # Demo mode: route all calls to configured demo numbers
+        dial_phone = provider.phone
+        cfg = get_settings()
+        if cfg.DEMO_MODE and cfg.DEMO_PHONE_NUMBERS:
+            demo_nums = [n.strip() for n in cfg.DEMO_PHONE_NUMBERS.split(",") if n.strip()]
+            if demo_nums:
+                dial_phone = demo_nums[i % len(demo_nums)]
+                logger.info("demo_override", original=provider.phone, dial=dial_phone)
+
         asyncio.create_task(
             _run_call_agent(
                 session_id,
                 ct.id,
                 provider,
-                provider.phone,
+                dial_phone,
                 user_id=user_id,
                 service_type=intent.service_type or "dentist appointment",
                 target_time=intent.target_time,
@@ -468,6 +557,12 @@ class SquadOrchestrator:
 
     def __init__(self, openai_client: AsyncOpenAI) -> None:
         self._client = openai_client
+        settings = get_settings()
+        self._llm = ChatOpenAI(
+            api_key=settings.OPENAI_API_KEY,
+            model="gpt-4o",
+            temperature=0.1,
+        )
 
     async def create_squad_plan(self, request: SessionRequest) -> SquadPlan:
         """Legacy: plan only, no DB. Prefer create_session_and_squad for full flow."""
@@ -491,47 +586,46 @@ class SquadOrchestrator:
             logger.info("intent_analysis_fallback_local", reason="OPENAI_API_KEY not set", event_type="orchestrator")
             return _analyze_intent_locally(prompt, user_location)
 
-        system = (
+        parser = PydanticOutputParser(pydantic_object=SessionIntent)
+
+        system_msg = (
             "You extract ALL booking details from the user's message so we have date, time, location. "
-            "Respond ONLY with a single JSON object. No markdown. "
             "Fields: service_type (required, e.g. dentist, mechanic, hairdresser, indian restaurant, italian restaurant, pizza place — keep qualifiers like cuisine type), "
             "target_date (YYYY-MM-DD or null if not specified or ASAP), "
             "target_time (morning|afternoon|evening|any or specific HH:MM 24h or null), "
             "urgency (string or null), "
             "location_query (city, area, address, or 'near me' / user_location; null only if no location given). "
-            "Infer concrete date when user says 'tomorrow', 'next Friday', etc. Infer time when user says '10am', '3pm'. Use user_location when they say 'near me' or don't specify a place."
+            "Infer concrete date when user says 'tomorrow', 'next Friday', etc. Infer time when user says '10am', '3pm'. Use user_location when they say 'near me' or don't specify a place.\n\n"
+            "{format_instructions}"
         )
-        user = f"User location: {user_location}\n\nUser message: {prompt}"
+
+        intent_prompt = ChatPromptTemplate.from_messages([
+            ("system", system_msg),
+            ("human", "User location: {user_location}\n\nUser message: {prompt}"),
+        ])
+
+        chain = intent_prompt | self._llm | parser
+
         try:
-            response = await self._client.chat.completions.create(
-                model="gpt-4o",
-                messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-                response_format={"type": "json_object"},
-                temperature=0.1,
-            )
-            raw = response.choices[0].message.content or ""
-            if not raw.strip():
-                raise ValueError("LLM returned empty intent JSON")
-            data: dict[str, Any] = json.loads(raw.strip())
-            target_date = data.get("target_date")
+            intent: SessionIntent = await chain.ainvoke({
+                "user_location": user_location,
+                "prompt": prompt,
+                "format_instructions": parser.get_format_instructions(),
+            })
+            # Validate target_date is not in the past
+            target_date = intent.target_date
             if target_date and isinstance(target_date, str):
                 try:
                     from datetime import date as dt_date
                     parsed = dt_date.fromisoformat(target_date.strip()[:10])
                     if parsed < dt_date.today():
-                        target_date = None
+                        intent = intent.model_copy(update={"target_date": None})
                 except (ValueError, TypeError):
                     pass
-            return SessionIntent(
-                service_type=data.get("service_type", "").strip() or "general",
-                target_date=target_date,
-                target_time=data.get("target_time"),
-                urgency=data.get("urgency"),
-                location_query=data.get("location_query") or user_location,
-                timezone=None,
-            )
+            logger.info("langchain_intent_analyzed", service_type=intent.service_type, event_type="orchestrator")
+            return intent
         except Exception as e:
-            logger.warning("intent_analysis_openai_failed", error=str(e), event_type="orchestrator")
+            logger.warning("langchain_intent_failed", error=str(e), event_type="orchestrator")
             return _analyze_intent_locally(prompt, user_location)
 
 
